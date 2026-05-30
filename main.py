@@ -24,6 +24,7 @@ HEADERS = {
     "Referer": "https://comix.to/",
 }
 CHUNK_SIZE = 1024 * 256
+COMPLETE_MARKER = ".download-complete.json"
 
 
 @dataclass(frozen=True)
@@ -248,6 +249,51 @@ def build_page_jobs(chapter, dest_dir):
     return jobs
 
 
+def completion_marker_path(dest_dir):
+    return dest_dir / COMPLETE_MARKER
+
+
+def expected_completion_manifest(chapter, jobs):
+    return {
+        "chapter_id": str(chapter.get("id")),
+        "page_count": len(jobs),
+        "files": [job.dest.name for job in jobs],
+    }
+
+
+def is_chapter_complete(chapter, jobs, dest_dir):
+    marker = completion_marker_path(dest_dir)
+    if not marker.exists():
+        return False
+
+    try:
+        with marker.open("r", encoding="utf-8") as fh:
+            manifest = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return False
+
+    if manifest != expected_completion_manifest(chapter, jobs):
+        return False
+
+    return all(job.dest.exists() and job.dest.stat().st_size > 0 for job in jobs)
+
+
+def mark_chapter_complete(chapter, jobs, dest_dir):
+    if not jobs:
+        return
+
+    if not all(job.dest.exists() and job.dest.stat().st_size > 0 for job in jobs):
+        return
+
+    marker = completion_marker_path(dest_dir)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    tmp_marker = marker.with_name(marker.name + ".part")
+    with tmp_marker.open("w", encoding="utf-8") as fh:
+        json.dump(expected_completion_manifest(chapter, jobs), fh, indent=2)
+        fh.write("\n")
+    os.replace(tmp_marker, marker)
+
+
 def download_page(job, overwrite, timeout, retries):
     if job.dest.exists() and job.dest.stat().st_size > 0 and not overwrite:
         return PageResult(job.index, "skipped", job.dest, job.dest.stat().st_size)
@@ -313,6 +359,10 @@ def download_chapter(
         print("  no page URLs found")
         return 1
 
+    if not overwrite and is_chapter_complete(chapter, jobs, dest_dir):
+        print("  skipped complete chapter")
+        return 0
+
     failures = 0
     completed = 0
     with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
@@ -331,6 +381,9 @@ def download_chapter(
                 )
             else:
                 print(f"  [{completed}/{len(jobs)}] {result.status} {result.dest.name}")
+
+    if failures == 0:
+        mark_chapter_complete(chapter, jobs, dest_dir)
 
     return failures
 

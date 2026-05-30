@@ -20,6 +20,6 @@ Download the first three English chapters from a manga id using eight page-downl
 uv run python main.py 2vzj2 --language en --limit 3 --workers 8
 ```
 
-Downloaded pages are written under `downloads/` by default. Use `--dry-run` to inspect selected chapters without downloading images, and `--overwrite` to replace existing page files.
+Downloaded pages are written under `downloads/` by default. Existing non-empty page files are skipped on repeat runs, and a `.download-complete.json` marker is written after a chapter finishes successfully so future runs can skip the whole chapter. Use `--dry-run` to inspect selected chapters without downloading images, and `--overwrite` to ignore existing pages and completion markers.
 
 A partially deobfuscated version of the `secure-[hash].js` file is included in this repo for reference. See [secure-dec.js](secure-dec.js).
