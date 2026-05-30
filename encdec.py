@@ -1,9 +1,12 @@
 from pathlib import Path
 import subprocess
-import urllib.parse
 import httpx
 
 SECURE_JS = Path(__file__).with_name("secure.js")
+SECURE_JS_URL = (
+    "https://comix.to/assets/build/35595e3de3c99889c1aa70/dist/"
+    "secure-tfsd33-MxlixIFJ.js"
+)
 
 BOOTSTRAP = """
 if (typeof window === "undefined") {
@@ -87,18 +90,20 @@ if (typeof window === "undefined") {
 }
 """
 
-# init secure.js
-print("Patching secure.js...")
-secure_js = httpx.get(
-    "https://comix.to/assets/build/35595e3de3c99889c1aa70/dist/secure-tfsd33-MxlixIFJ.js"
-).text
-with open(SECURE_JS, "w") as f:
-    f.write(BOOTSTRAP + "\n" + secure_js)
+def ensure_secure_js(force=False):
+    if SECURE_JS.exists() and not force:
+        return
 
-print("Initialization complete.")
+    print("Patching secure.js...")
+    with httpx.Client(timeout=30, follow_redirects=True) as client:
+        resp = client.get(SECURE_JS_URL)
+        resp.raise_for_status()
+    SECURE_JS.write_text(BOOTSTRAP + "\n" + resp.text)
+    print("Initialization complete.")
 
 
 def sign(url):
+    ensure_secure_js()
     result = subprocess.run(
         ["node", str(SECURE_JS), "sign", url],
         capture_output=True,
@@ -116,6 +121,7 @@ def sign(url):
 
 
 def decrypt(data):
+    ensure_secure_js()
     result = subprocess.run(
         ["node", str(SECURE_JS), "decrypt", data],
         capture_output=True,
