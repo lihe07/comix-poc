@@ -24,12 +24,3 @@ Downloaded pages are written under `downloads/` by default. Existing non-empty p
 
 A partially deobfuscated version of the `secure-[hash].js` file is included in this repo for reference. See [secure_dec.js](secure_dec.js).
 
-## Rod renderer downloader
-
-`rod_downloader.go` is a separate Go/Rod downloader for reader pages that render pages as either raw `<img>` tags or `<canvas>` tags. It signs/decrypts API metadata in a browser page with the site `ro` and `io` functions, then visits each chapter page and saves raw image URLs directly or captures canvases with `canvas.toDataURL("image/png")`.
-
-```bash
-go run ./rod_downloader.go "https://comix.to/title/2vzj2-im-in-love-with-the-villainess/8998931-chapter-61"
-```
-
-Rendered output is written under `downloads-rod/` by default. Use `--headful` to watch the browser, `--render-timeout` if canvas pages need longer to paint, and the same target styles as the Python downloader for chapter URLs, chapter ids, manga URLs, and manga ids.
