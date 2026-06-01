@@ -40,6 +40,11 @@ const (
     configurable: false,
     writable: false
   });
+  Object.defineProperty(window, "__comixNativeCanvasGetImageData", {
+    value: CanvasRenderingContext2D.prototype.getImageData,
+    configurable: false,
+    writable: false
+  });
 })()`
 	chapterPageScript = `async (pageNo, pageIndex, settleMs, timeoutMs) => {
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -80,6 +85,31 @@ const (
     return el;
   };
 
+  const canvasHasVisiblePixels = (canvas) => {
+    try {
+      const probeSize = 32;
+      const probe = document.createElement("canvas");
+      probe.width = probeSize;
+      probe.height = probeSize;
+      const ctx = probe.getContext("2d", { willReadFrequently: true });
+      if (!ctx) return { readable: false, visible: false, error: "canvas has no 2d context" };
+      ctx.clearRect(0, 0, probeSize, probeSize);
+      ctx.drawImage(canvas, 0, 0, probeSize, probeSize);
+      const getImageData = window.__comixNativeCanvasGetImageData || CanvasRenderingContext2D.prototype.getImageData;
+      const data = getImageData.call(ctx, 0, 0, probeSize, probeSize).data;
+      for (let i = 3; i < data.length; i += 4) {
+        if (data[i] !== 0) return { readable: true, visible: true };
+      }
+      return { readable: true, visible: false, error: "canvas snapshot is fully transparent" };
+    } catch (err) {
+      return {
+        readable: false,
+        visible: false,
+        error: err && err.message ? err.message : String(err)
+      };
+    }
+  };
+
   const snapshot = async (el) => {
     if (!el) return { page: pageNo, kind: "unknown", error: "page element disappeared" };
 
@@ -108,22 +138,28 @@ const (
           const toDataURL = window.__comixNativeCanvasToDataURL || HTMLCanvasElement.prototype.toDataURL;
           const dataURL = toDataURL.call(canvas, "image/png");
           // The scrambled image is painted onto the canvas asynchronously (the
-          // descramble can take ~1s after the slide). Before that the canvas is
-          // effectively blank and serializes to roughly the same size as a fresh
-          // blank canvas of the same dimensions. Compare against that baseline so
-          // we keep polling instead of capturing an empty frame. (The canvas is
-          // read-tainted, so getImageData cannot be used for this check.)
+          // descramble can take ~1s after the slide). Keep polling while the
+          // canvas is still fully transparent; if pixel reads are blocked, fall
+          // back to comparing the PNG data URL against a fresh blank canvas.
           const ref = document.createElement("canvas");
           ref.width = canvas.width;
           ref.height = canvas.height;
-          const blankLen = toDataURL.call(ref, "image/png").length;
-          if (dataURL && dataURL.length > blankLen * 1.2) {
+          const blankURL = toDataURL.call(ref, "image/png");
+          const visible = canvasHasVisiblePixels(canvas);
+          if (dataURL && dataURL !== blankURL && (!visible.readable || visible.visible)) {
             return {
               page: pageNo,
               kind: "canvas",
               dataURL,
               width: canvas.width,
               height: canvas.height
+            };
+          }
+          if (visible.readable && !visible.visible) {
+            return {
+              page: pageNo,
+              kind: "canvas",
+              error: visible.error || "canvas snapshot is fully transparent"
             };
           }
         } catch (err) {
@@ -284,6 +320,12 @@ type pageFile struct {
 	Page int    `json:"page"`
 	File string `json:"file"`
 	Kind string `json:"kind"`
+}
+
+type completionManifest struct {
+	ChapterID string     `json:"chapter_id"`
+	PageCount int        `json:"page_count"`
+	Files     []pageFile `json:"files"`
 }
 
 type pageEntry struct {
@@ -618,7 +660,42 @@ func (a *apiClient) fetchMangaChapters(mangaID, order, language string) ([]chapt
 			break
 		}
 	}
-	return chapters, nil
+	return dedupeChapters(chapters), nil
+}
+
+// dedupeChapters collapses chapters that share the same chapter number. comix.to
+// lists every translation of a chapter as a separate entry under the same
+// number, which would otherwise download the same chapter multiple times. The
+// listing order is preserved; when page counts are known (embedded in the
+// listing) the variant with more pages wins, otherwise the first seen is kept.
+func dedupeChapters(chapters []chapter) []chapter {
+	seen := make(map[string]int, len(chapters))
+	out := make([]chapter, 0, len(chapters))
+	for _, ch := range chapters {
+		key := chapterNumberKey(ch)
+		if idx, ok := seen[key]; ok {
+			if len(ch.Pages) > len(out[idx].Pages) {
+				out[idx] = ch
+			}
+			continue
+		}
+		seen[key] = len(out)
+		out = append(out, ch)
+	}
+	return out
+}
+
+// chapterNumberKey identifies chapters that should be treated as duplicates.
+// Chapters without a usable number, or bucketed under number 0 (comix.to files
+// volumes/specials/previews there, which are distinct content rather than
+// translations of one another), fall back to their unique id so they are never
+// collapsed together.
+func chapterNumberKey(ch chapter) string {
+	label := numberLabel(ch.Number)
+	if label == "chapter" || label == "ch-0" {
+		return "id:" + ch.ID
+	}
+	return label
 }
 
 func (a *apiClient) fetchChapter(chapterID string) (chapter, error) {
@@ -640,11 +717,14 @@ func downloadRenderedChapter(api *apiClient, browser *rod.Browser, pagePtr **rod
 	fmt.Fprintf(out, "  url: %s\n", chapterURL)
 	fmt.Fprintf(out, "  output: %s\n", destDir)
 
-	// Fast path: a finished chapter already has its completion marker, so there
-	// is no need to fetch metadata or render anything.
+	// Fast path: a finished chapter with a valid completion marker does not need
+	// to fetch metadata or render anything.
 	if !cfg.overwrite && !cfg.dryRun && fileExists(filepath.Join(destDir, completeMarker)) {
-		fmt.Fprintln(out, "  already complete, skipping")
-		return 0, nil
+		if completeMarkerValid(destDir) {
+			fmt.Fprintln(out, "  already complete, skipping")
+			return 0, nil
+		}
+		fmt.Fprintln(out, "  completion marker has invalid files, repairing")
 	}
 
 	// Page URLs (and the scramble flag) come straight from the chapter API.
@@ -853,6 +933,12 @@ func snapshotPage(page *rod.Page, entry pageEntry, cfg config) (pageSnapshot, er
 			lastErr = err
 			continue
 		}
+		if snap.Kind == "canvas" && snap.Error == "" {
+			if err := validateCanvasDataURL(snap.DataURL); err != nil {
+				lastErr = err
+				continue
+			}
+		}
 		return snap, nil
 	}
 	return pageSnapshot{}, lastErr
@@ -927,23 +1013,15 @@ func downloadImage(client *http.Client, imageURL, dest string, cfg config) (stri
 }
 
 func writeDataURL(dest, dataURL string, overwrite bool) (string, error) {
-	if fileExists(dest) && !overwrite && validPNGFile(dest) {
+	if fileExists(dest) && !overwrite && validCanvasPNGFile(dest) {
 		return "skipped", nil
 	}
-	const prefix = "data:image/png;base64,"
-	if !strings.HasPrefix(dataURL, prefix) {
-		return "", errors.New("canvas snapshot was not a PNG data URL")
-	}
-	raw, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(dataURL, prefix))
+	raw, err := decodeCanvasDataURL(dataURL)
 	if err != nil {
 		return "", err
 	}
-	config, _, err := image.DecodeConfig(bytes.NewReader(raw))
-	if err != nil {
+	if err := validateCanvasPNG(raw); err != nil {
 		return "", err
-	}
-	if config.Width <= 1 || config.Height <= 1 {
-		return "", fmt.Errorf("canvas snapshot is %dx%d", config.Width, config.Height)
 	}
 	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 		return "", err
@@ -959,15 +1037,70 @@ func writeDataURL(dest, dataURL string, overwrite bool) (string, error) {
 	return "captured", nil
 }
 
-func validPNGFile(filename string) bool {
+func decodeCanvasDataURL(dataURL string) ([]byte, error) {
+	const prefix = "data:image/png;base64,"
+	if !strings.HasPrefix(dataURL, prefix) {
+		return nil, errors.New("canvas snapshot was not a PNG data URL")
+	}
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(dataURL, prefix))
+	if err != nil {
+		return nil, err
+	}
+	return raw, nil
+}
+
+func validateCanvasDataURL(dataURL string) error {
+	raw, err := decodeCanvasDataURL(dataURL)
+	if err != nil {
+		return err
+	}
+	return validateCanvasPNG(raw)
+}
+
+func validateCanvasPNG(raw []byte) error {
+	img, format, err := image.Decode(bytes.NewReader(raw))
+	if err != nil {
+		return err
+	}
+	return validateCanvasImage(img, format)
+}
+
+func validateCanvasImage(img image.Image, format string) error {
+	if format != "png" {
+		return errors.New("canvas snapshot was not a PNG image")
+	}
+	bounds := img.Bounds()
+	if bounds.Dx() <= 1 || bounds.Dy() <= 1 {
+		return fmt.Errorf("canvas snapshot is %dx%d", bounds.Dx(), bounds.Dy())
+	}
+	if imageFullyTransparent(img) {
+		return errors.New("canvas snapshot is fully transparent")
+	}
+	return nil
+}
+
+func imageFullyTransparent(img image.Image) bool {
+	bounds := img.Bounds()
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			_, _, _, a := img.At(x, y).RGBA()
+			if a != 0 {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func validCanvasPNGFile(filename string) bool {
 	fh, err := os.Open(filename)
 	if err != nil {
 		return false
 	}
 	defer fh.Close()
 
-	config, _, err := image.DecodeConfig(fh)
-	return err == nil && config.Width > 1 && config.Height > 1
+	img, format, err := image.Decode(fh)
+	return err == nil && validateCanvasImage(img, format) == nil
 }
 
 func parseTarget(raw string) (target, error) {
@@ -1081,10 +1214,10 @@ func chapterDir(output string, ch chapter) string {
 
 func writeCompletionMarker(destDir string, ch chapter, files []pageFile) error {
 	sort.Slice(files, func(i, j int) bool { return files[i].Page < files[j].Page })
-	manifest := map[string]any{
-		"chapter_id": ch.ID,
-		"page_count": len(files),
-		"files":      files,
+	manifest := completionManifest{
+		ChapterID: ch.ID,
+		PageCount: len(files),
+		Files:     files,
 	}
 	raw, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
@@ -1096,6 +1229,40 @@ func writeCompletionMarker(destDir string, ch chapter, files []pageFile) error {
 		return err
 	}
 	return os.Rename(tmp, filepath.Join(destDir, completeMarker))
+}
+
+func completeMarkerValid(destDir string) bool {
+	raw, err := os.ReadFile(filepath.Join(destDir, completeMarker))
+	if err != nil {
+		return false
+	}
+	var manifest completionManifest
+	if err := json.Unmarshal(raw, &manifest); err != nil {
+		return false
+	}
+	if len(manifest.Files) == 0 {
+		return false
+	}
+	if manifest.PageCount != 0 && manifest.PageCount != len(manifest.Files) {
+		return false
+	}
+	for _, file := range manifest.Files {
+		if !completionFileValid(destDir, file) {
+			return false
+		}
+	}
+	return true
+}
+
+func completionFileValid(destDir string, file pageFile) bool {
+	if file.Page <= 0 || file.File == "" || filepath.IsAbs(file.File) || file.File != filepath.Base(file.File) {
+		return false
+	}
+	filename := filepath.Join(destDir, file.File)
+	if strings.EqualFold(file.Kind, "canvas") || (file.Kind == "" && strings.EqualFold(filepath.Ext(file.File), ".png")) {
+		return validCanvasPNGFile(filename)
+	}
+	return fileExists(filename)
 }
 
 func extensionForURL(rawURL, fallbackExt string) string {
@@ -1236,6 +1403,12 @@ func existingPageFile(destDir string, page int) (string, bool) {
 	}
 	for _, m := range matches {
 		if strings.HasSuffix(m, ".part") {
+			continue
+		}
+		if strings.EqualFold(filepath.Ext(m), ".png") {
+			if validCanvasPNGFile(m) {
+				return filepath.Base(m), true
+			}
 			continue
 		}
 		if fileExists(m) {
