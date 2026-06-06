@@ -6,7 +6,17 @@ Latest updates to `Comix.to` added Pro obfuscator.io to the JavaScript, which co
 
 This PoC automatically patches the obfuscated `secure-[hash].js` file, and uses Node.js to emulate the decryption and signing functions.
 
-## Usage
+## Usage (Go)
+
+The Go version of the script can download and unscramble images, but it requires the dependencies in order to run a headless browser.
+
+```bash
+go run rod_downloader.go "https://comix.to/title/2vzj2-im-in-love-with-the-villainess"
+```
+
+## Usage (Python)
+
+*Python version of the script DOES NOT unscramble the images.*
 
 Install dependencies with `uv sync`, then download a chapter:
 
@@ -24,3 +34,8 @@ Downloaded pages are written under `downloads/` by default. Existing non-empty p
 
 A partially deobfuscated version of the `secure-[hash].js` file is included in this repo for reference. See [secure_dec.js](secure_dec.js).
 
+## Duplicated Chapters
+
+By default, the script skips chapters with duplicate indices, (e.g. only one translation of Chapter 1 will be downloaded).
+
+However, the source sometimes label different translations of the same chapter with different indices (e.g. 1 and 1.5). In these cases, the script will download both chapters by default.
